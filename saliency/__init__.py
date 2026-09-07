@@ -1,6 +1,7 @@
 """Saliency — CATALINA / GWT Kyiv population. Same engine as the instrument."""
 
 from .engine import (
+    ACTIONS,
     DEFAULT_PARAMS,
     MINUTES,
     PERIODS,
@@ -23,6 +24,7 @@ from .engine import (
 )
 
 __all__ = [
+    "ACTIONS",
     "DEFAULT_PARAMS",
     "MINUTES",
     "PERIODS",

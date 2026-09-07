@@ -1,6 +1,6 @@
 # Saliency — peer-review notebook
 
-A CATALINA / Global Workspace Theory population on a measured Kyiv. This repository is the **executable** copy of the instrument: same engine, same seeds, same files.
+A CATALINA / Global Workspace Theory population on a measured Kyiv. This repository is the **executable** copy of the instrument: same engine, same seeds, same files. Running `notebooks/saliency_review.ipynb` re-computes the same peaks the live instrument shows.
 
 Van Dijcke, D., Wright, A. L., & Polyak, M. (2023). Public response to government alerts saves lives during Russian invasion of Ukraine. *PNAS*, 120(18), e2220160120.
 
@@ -13,7 +13,9 @@ python -m pip install -r requirements.txt
 jupyter notebook notebooks/saliency_review.ipynb
 ```
 
-The notebook pulls `data/` from this repo (or from GitHub raw URLs if you only downloaded the `.ipynb`). It then runs:
+The first cell loads `saliency/` from this checkout (or `pip install git+https://github.com/testing-crsscl/saliency-kyiv.git` if you only have the `.ipynb`). Data is read from `data/` here, or fetched from GitHub raw URLs.
+
+It then runs the same pipeline as the instrument:
 
 1. Ingest (OSM grid, WorldPop, WVS Wave 7 Kyiv, alert times, reconstructed Van Dijcke curves)
 2. Lattice + population
@@ -39,7 +41,7 @@ This is **not** a fitted replication of the original coefficients (those files a
 ## Layout
 
 ```
-data/          measured + reconstructed JSON
+data/          measured + reconstructed JSON (also served from GitHub raw)
 saliency/      the engine (Python port of the TypeScript instrument)
 notebooks/     executable review notebook
 ```
