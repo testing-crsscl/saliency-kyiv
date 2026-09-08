@@ -18,14 +18,31 @@ DEFAULT_PARAMS = {
     "calendarTauDays": 201,
 }
 
+APPRAISAL_PRIOR = (0.35, 0.25, 0.15, 0.1, 0.1, 0.05)
 APPRAISAL_WEIGHTS = {
-    "scepticismInv": 0.35,
-    "confArmy": 0.25,
-    "security": 0.15,
-    "confGov": 0.1,
-    "neighInsecurity": 0.1,
-    "fight": 0.05,
+    "scepticismInv": APPRAISAL_PRIOR[0],
+    "confArmy": APPRAISAL_PRIOR[1],
+    "security": APPRAISAL_PRIOR[2],
+    "confGov": APPRAISAL_PRIOR[3],
+    "neighInsecurity": APPRAISAL_PRIOR[4],
+    "fight": APPRAISAL_PRIOR[5],
 }
+APPRAISAL_CUE_LABELS = (
+    "1 − scepticism",
+    "confArmy",
+    "security vs freedom",
+    "confGov",
+    "1 − neighbourhood secure",
+    "willingness to fight",
+)
+APPRAISAL_KAPPA = 12
+DEFIANCE_PRIOR = (0.55, 0.2, 0.15)
+DEFIANCE_KAPPA = 10
+STAY_MIX_MEAN = 0.4
+STAY_MIX_BETA = (8, 12)
+IDLE_BETA = (12, 28)
+ACOUSTIC_BETA = (28, 2.1)
+TAU_LOG_SIGMA = 0.22
 
 SHELTER_IN_PLACE_METRES = 18
 EVENT_T0 = -10
@@ -95,6 +112,49 @@ def lognormal(rng: Rng, mu: float, sigma: float) -> float:
     return math.exp(mu + sigma * gauss(rng))
 
 
+def gamma(rng: Rng, shape: float) -> float:
+    """Marsaglia–Tsang gamma(shape, 1). Same loop as src/sim/rng.ts."""
+    if shape < 1e-12:
+        return 0.0
+    if shape < 1:
+        u = max(1e-12, rng())
+        return gamma(rng, shape + 1) * (u ** (1.0 / shape))
+    d = shape - 1.0 / 3.0
+    c = 1.0 / math.sqrt(9.0 * d)
+    while True:
+        x = 0.0
+        v = 0.0
+        while True:
+            x = gauss(rng)
+            v = 1.0 + c * x
+            if v > 0:
+                break
+        v = v * v * v
+        u = rng()
+        x2 = x * x
+        if u < 1.0 - 0.0331 * x2 * x2:
+            return d * v
+        if math.log(u) < 0.5 * x2 + d * (1.0 - v + math.log(v)):
+            return d * v
+
+
+def beta(rng: Rng, a: float, b: float) -> float:
+    x = gamma(rng, a)
+    y = gamma(rng, b)
+    s = x + y
+    if s <= 0:
+        return a / (a + b)
+    return x / s
+
+
+def dirichlet(rng: Rng, alpha) -> List[float]:
+    g = [gamma(rng, max(float(a), 1e-6)) for a in alpha]
+    s = sum(g)
+    if s <= 0:
+        return [1.0 / len(alpha)] * len(alpha)
+    return [x / s for x in g]
+
+
 def pick_weighted(pool: List[dict], rng: Rng) -> dict:
     tot = sum(p.get("w", 1) or 0 for p in pool)
     u = rng() * tot
@@ -117,35 +177,63 @@ def num(v, default=0.5) -> float:
     return x
 
 
+def union_probability(cues, weights) -> float:
+    log_survive = 0.0
+    n = max(len(cues), len(weights))
+    for i in range(n):
+        p = clamp(cues[i] if i < len(cues) else 0.0, 0.0, 1.0 - 1e-12)
+        w = max(0.0, weights[i] if i < len(weights) else 0.0)
+        log_survive += w * math.log(1.0 - p)
+    return clamp(1.0 - math.exp(log_survive), 0.0, 0.999)
+
+
+def threat_cues(agent: dict) -> List[float]:
+    return [
+        1.0 - agent["scepticism"],
+        agent["confArmy"],
+        agent["security"],
+        agent["confGov"],
+        1.0 - agent["neighSecure"],
+        agent["fight"],
+    ]
+
+
+def defiance_cues(agent: dict) -> List[float]:
+    return [agent["defiance"], 1.0 - agent["security"], 1.0 - agent["confArmy"]]
+
+
 def focused_attention_threshold(saliency_threshold: float) -> float:
     return saliency_threshold + (1 - saliency_threshold) / 2
 
 
-def acoustic_saliency(exposure: float, p: dict = DEFAULT_PARAMS) -> float:
-    tau = max(1, p["habituationTau"])
-    return min(0.999, max(0.0, p["acousticBase"] * math.exp(-exposure / tau)))
+def acoustic_saliency(exposure: float, p: dict = None, agent: dict = None) -> float:
+    p = p or DEFAULT_PARAMS
+    base = (agent or {}).get("acousticBase", p["acousticBase"])
+    tau = max(1.0, (agent or {}).get("habituationTau", p["habituationTau"]))
+    return min(0.999, max(0.0, base * math.exp(-exposure / tau)))
 
 
 def appraise_threat(agent: dict) -> float:
-    W = APPRAISAL_WEIGHTS
-    threat = (
-        W["scepticismInv"] * (1 - agent["scepticism"])
-        + W["confArmy"] * agent["confArmy"]
-        + W["security"] * agent["security"]
-        + W["confGov"] * agent["confGov"]
-        + W["neighInsecurity"] * (1 - agent["neighSecure"])
-        + W["fight"] * agent["fight"]
-    )
-    return min(1.0, max(0.0, threat))
+    w = agent.get("appraisalW") or list(APPRAISAL_PRIOR)
+    return union_probability(threat_cues(agent), w)
 
 
-def stay_safe_saliency(agent: dict, p: dict = DEFAULT_PARAMS) -> float:
-    acoustic = acoustic_saliency(agent["exposure"], p)
-    return min(0.999, acoustic * (0.4 + 0.6 * appraise_threat(agent)))
+def defiance_strength(agent: dict) -> float:
+    w = agent.get("defianceW") or list(DEFIANCE_PRIOR)
+    return union_probability(defiance_cues(agent), w)
+
+
+def stay_safe_saliency(agent: dict, p: dict = None) -> float:
+    p = p or DEFAULT_PARAMS
+    acoustic = acoustic_saliency(agent["exposure"], p, agent)
+    threat = appraise_threat(agent)
+    a = agent.get("stayMix", STAY_MIX_MEAN)
+    nominated = 1.0 - (1.0 - a) * (1.0 - threat)
+    return min(0.999, acoustic * nominated)
 
 
 def siren_saliency(agent: dict, p: dict) -> float:
-    return acoustic_saliency(agent["exposure"], p)
+    return acoustic_saliency(agent["exposure"], p, agent)
 
 
 def draw_routine(hour: int, weekday: int, employed: bool, rng: Rng) -> str:
@@ -186,6 +274,19 @@ def draw_sip_bias(belief: dict, rng: Rng) -> float:
     autonomy = 0.22 * au
     noise = (rng() - 0.5) * 0.16
     return clamp(0.22 + elderly + autonomy + noise, 0.05, 0.85)
+
+
+def draw_processor(rng: Rng, p: dict) -> dict:
+    idle_mean = IDLE_BETA[0] / (IDLE_BETA[0] + IDLE_BETA[1])
+    ac_mean = ACOUSTIC_BETA[0] / (ACOUSTIC_BETA[0] + ACOUSTIC_BETA[1])
+    return {
+        "appraisalW": dirichlet(rng, [m * APPRAISAL_KAPPA for m in APPRAISAL_PRIOR]),
+        "defianceW": dirichlet(rng, [m * DEFIANCE_KAPPA for m in DEFIANCE_PRIOR]),
+        "stayMix": clamp(beta(rng, STAY_MIX_BETA[0], STAY_MIX_BETA[1]), 0.12, 0.75),
+        "idleBar": clamp(p["idleThreshold"] + (beta(rng, IDLE_BETA[0], IDLE_BETA[1]) - idle_mean), 0.12, 0.55),
+        "acousticBase": clamp(p["acousticBase"] + (beta(rng, ACOUSTIC_BETA[0], ACOUSTIC_BETA[1]) - ac_mean), 0.45, 0.995),
+        "habituationTau": clamp(lognormal(rng, math.log(max(1.0, p["habituationTau"])), TAU_LOG_SIGMA), 80, 1e9),
+    }
 
 
 def cell_center(env: dict, i: int, j: int) -> Tuple[float, float]:
@@ -312,9 +413,10 @@ def empty_gw() -> dict:
 
 def apply_routine_thresholds(agent: dict, p: dict) -> None:
     if agent["routine"] == "idle":
+        bar = agent.get("idleBar", p["idleThreshold"])
         agent["focused"] = False
-        agent["saliencyThreshold"] = p["idleThreshold"]
-        agent["attentionThreshold"] = p["idleThreshold"]
+        agent["saliencyThreshold"] = bar
+        agent["attentionThreshold"] = bar
         return
     sal = 0.8 if agent["routine"] == "asleep" else 0.5
     agent["focused"] = True
@@ -329,11 +431,17 @@ def seed_agent(id_: int, env: dict, belief: dict, p: dict, rng: Rng, exposure: f
     sex = "Male" if belief.get("sex") == "Male" else "Female"
     employed = num(belief.get("em"), 0) > 0.5
     routine = draw_routine(hour, weekday, employed, rng)
+    x = cx + (rng() - 0.5) * env["cellM"] * 0.4
+    y = cy + (rng() - 0.5) * env["cellM"] * 0.4
+    walk = draw_walk_speed_mpm(age, sex, rng)
+    lag = draw_decision_lag_min(age, rng)
+    sip = draw_sip_bias(belief, rng)
+    proc = draw_processor(rng, p)
     agent = {
         "id": id_,
         "i": cell["i"], "j": cell["j"],
-        "x": cx + (rng() - 0.5) * env["cellM"] * 0.4,
-        "y": cy + (rng() - 0.5) * env["cellM"] * 0.4,
+        "x": x,
+        "y": y,
         "age": age, "sex": sex, "employed": employed,
         "scepticism": belief["sc"],
         "defiance": num(belief.get("df"), 0.32),
@@ -345,13 +453,14 @@ def seed_agent(id_: int, env: dict, belief: dict, p: dict, rng: Rng, exposure: f
         "socialTrust": num(belief.get("st"), 0.3),
         "neighSecure": num(belief.get("ns"), 0.7),
         "fight": num(belief.get("fi"), 0.6),
-        "walkSpeedMpm": draw_walk_speed_mpm(age, sex, rng),
-        "decisionLagMin": draw_decision_lag_min(age, rng),
-        "sipBias": draw_sip_bias(belief, rng),
+        "walkSpeedMpm": walk,
+        "decisionLagMin": lag,
+        "sipBias": sip,
+        **proc,
         "routine": routine,
         "focused": False,
-        "saliencyThreshold": p["idleThreshold"],
-        "attentionThreshold": p["idleThreshold"],
+        "saliencyThreshold": proc["idleBar"],
+        "attentionThreshold": proc["idleBar"],
         "standing": [{"id": "Stay_Safe", "kind": "practical", "standing": True, "active": False, "saliency": 0, "precondition": True}],
         "active": [],
         "intentions": [],

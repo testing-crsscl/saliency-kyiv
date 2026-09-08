@@ -1,4 +1,5 @@
 from .cycle import *
+import math
 
 BELIEFS = [
     {"sc": 0.3, "df": 0.4, "au": 0.5, "ta": 0.4, "ca": 0.7, "cg": 0.4, "se": 0.8, "st": 0.4, "ns": 0.6, "fi": 0.7, "em": 1, "w": 1, "age": 34, "sex": "Male"},
@@ -63,7 +64,7 @@ def run_architecture_tests(params: dict = None) -> List[dict]:
     keys = ",".join(sorted(share.keys()))
     check("T10", "Declared action space", keys == "continue,evacuate,move,shelter_in_place", keys)
     check("T11", "No free sliders", p["idleThreshold"] == 0.3 and p["acousticBase"] == 0.93,
-          "Idle threshold is CATALINA 0.30; acoustic base is a named constant. Individual variation is sampled, not slid.")
+          "Idle mean is CATALINA 0.30; acoustic mean is Dehaene 0.93. Individuals draw Beta around those means. Nothing is a slider.")
     check("T12", "Confidence refuses without pairs", True,
           "Confidence is unfitted. It reads internal state at the decision cycle and needs (simulation, observed) pairs — the original Van Dijcke coefficients, which are not in hand.")
     folds = [{"holdout": h, "train": [r for r in ["West 1", "West 2", "South", "East 1", "East 2", "Centre", "North"] if r != h]}
@@ -119,17 +120,44 @@ def run_architecture_tests(params: dict = None) -> List[dict]:
     check("T21", "Initial positions follow population density, not WVS coordinates",
           at_hot > 300 and at_hot > 8 * at_cold,
           f"WVS PSU pinned on the sparse cell ({at_cold}); WorldPop mass 100:1 put {at_hot}/400 on the dense cell")
+    mean_w = list(APPRAISAL_PRIOR)
+    union = union_probability(threat_cues(trusting), mean_w)
+    linear = sum(mean_w[i] * threat_cues(trusting)[i] for i in range(len(mean_w)))
+    check("T22", "Appraisal is the probability of the union, not an arithmetic sum",
+          abs(union - linear) > 1e-4 and 0 < union < 1,
+          f"noisy-OR {union:.3f} vs Σ w·x {linear:.3f}. Same cues, different algebra.")
+    twins = make_population(8, env, [BELIEFS[0]], p, mulberry32(13), 0)
+    w_spread = max(abs(a["appraisalW"][0] - twins[0]["appraisalW"][0]) for a in twins)
+    idle_spread = max(a["idleBar"] for a in twins) - min(a["idleBar"] for a in twins)
+    check("T23", "Mapping weights are a distribution, not a shared vector",
+          w_spread > 0.01 and all(abs(sum(a["appraisalW"]) - 1) < 1e-6 for a in twins),
+          f"same WVS respondent, Dirichlet γ_sc range {w_spread:.3f}; simplex sums to 1")
+    idles = [a["idleBar"] for a in pop]
+    taus = [a["habituationTau"] for a in pop]
+    check("T24", "Idle bar and τ are sampled around their named means",
+          max(idles) - min(idles) > 0.04 and max(taus) - min(taus) > 20,
+          f"idle {min(idles):.2f}–{max(idles):.2f} around 0.30; τ {min(taus):.0f}–{max(taus):.0f} around 230")
+    check("T25", "Stay_Safe of a trusting agent is a probability in (0,1)",
+          0 < stay_safe_saliency(trusting, p) < 1 and idle_spread > 0.01,
+          f"Stay_Safe(trusting)={stay_safe_saliency(trusting, p):.3f}; idle-bar spread among twins {idle_spread:.3f}")
     return out
 
 
 def acoustic_table(p: dict = None):
     p = p or DEFAULT_PARAMS
     rows = []
-    for n in (0, 40, 100, 175, 220, 230, 360, 406):
+    for i, n in enumerate((0, 40, 100, 175, 220, 230, 360, 406)):
         a = acoustic_saliency(n, p)
+        rng = mulberry32(90 + i)
+        ignite = 0
+        draws = 400
+        for _ in range(draws):
+            if a >= draw_processor(rng, p)["idleBar"]:
+                ignite += 1
         rows.append({
             "n": n, "acoustic": a,
             "ignitesIdle": a >= p["idleThreshold"],
+            "idleShare": ignite / draws,
             "ignitesCommitted": a >= 0.75,
             "ignitesAsleep": a >= 0.9,
         })
@@ -151,7 +179,7 @@ def typical_kyivan_appraisal(wvs: dict) -> dict:
         "threat": appraise_threat(traits),
         "stay0": stay_safe_saliency(traits, DEFAULT_PARAMS),
         "stay406": stay_safe_saliency({**traits, "exposure": 406}, DEFAULT_PARAMS),
-        "defianceGate": 0.55 * traits["defiance"] + 0.2 * (1 - traits["security"]) + 0.15 * (1 - traits["confArmy"]),
+        "defianceGate": defiance_strength(traits),
         "acoustic0": acoustic_saliency(0),
     }
 
@@ -230,9 +258,155 @@ def run_first_alert(env, pool, alert, vd, n_agents=140, seed=21) -> dict:
     }
 
 
+def _layer(n, id_, name, catalina, what, value, gate):
+    return {
+        "n": n, "id": id_, "name": name, "catalina": catalina,
+        "what": what, "value": value, "gate": gate,
+    }
+
+
 def trace_minute(agent_in: dict, env: dict, p: dict, siren_on: bool, minute: int) -> dict:
+    """Same 12-layer walk as src/sim/trace.ts. Not a second model."""
     agent = clone_agents([agent_in])[0]
-    working_cycle(agent, env, p, siren_on, minute)
+    steps = []
+    n = 1
+    raw = bool(siren_on)
+    steps.append(_layer(
+        n, "L1", "Perception", "perceptionProcessing",
+        "Is the siren physically on this minute?",
+        "siren ON" if raw else "siren OFF",
+        "pass" if raw else "stop",
+    ))
+    n += 1
+    selected = information_selection(agent, p, raw)
+    acoustic = acoustic_saliency(agent["exposure"], p, agent)
+    steps.append(_layer(
+        n, "L2", "Information selection", "informationSelection",
+        f"Habituated acoustic saliency s₀ exp(−n/τ), n = {agent['exposure']}, "
+        f"this agent's s₀ {agent['acousticBase']:.2f} τ {agent['habituationTau']:.0f}",
+        f"saliency {selected['saliency']:.3f}" if selected else "no stimulus (siren off)",
+        "pass" if selected else "stop",
+    ))
+    n += 1
+    stim = stimulus_inhibition(agent, selected)
+    if stim:
+        l3 = f"IGNITES — {stim['saliency']:.3f} ≥ {agent['attentionThreshold']:.3f}"
+        g3 = "pass"
+    elif selected:
+        l3 = f"ABSENT — {selected['saliency']:.3f} < {agent['attentionThreshold']:.3f}"
+        g3 = "stop"
+    else:
+        l3 = "no stimulus"
+        g3 = "stop"
+    steps.append(_layer(
+        n, "L3", "Stimulus inhibition / ignition", "stimulusInhibition",
+        f"Coalition vs attention bar {agent['attentionThreshold']:.3f} (routine {agent['routine']})",
+        l3, g3,
+    ))
+    n += 1
+    gw_maintenance(agent, stim)
+    steps.append(_layer(
+        n, "L4", "Workspace occupancy", "gwMaintenance",
+        "Broadcast to standing desires, or empty workspace",
+        f"winner {agent['gw']['winner']}" if agent["gw"]["ignited"] else "workspace empty",
+        "pass" if agent["gw"]["ignited"] else "info",
+    ))
+    n += 1
+    desire_deletion(agent)
+    intention_deletion(agent)
+    steps.append(_layer(
+        n, "L5", "Desire / intention deletion", "desireDeletion + intentionDeletion",
+        "Drop contents below the current saliency bar",
+        f"active {len(agent['active'])}, intentions {len(agent['intentions'])}",
+        "info",
+    ))
+    n += 1
+    exogenous = switching_to_stimulus(agent, p)
+    threat = appraise_threat(agent)
+    stay = stay_safe_saliency(agent, p)
+    defy = defiance_strength(agent)
+    if stim:
+        steps.append(_layer(
+            n, "L6", "Appraisal processor", "appraiseThreat",
+            "P(∪ cues) = 1 − ∏ (1 − cue_i)^{γ_i}  (union of WVS probabilities, γ ~ Dirichlet)",
+            f"threat {threat:.3f}", "info",
+        ))
+        n += 1
+        steps.append(_layer(
+            n, "L7", "Stay_Safe saliency", "staySafeSaliency",
+            "P(hear) · P(floor ∪ threat) = acoustic · [1 − (1−α)(1−threat)]",
+            f"{stay:.3f}", "info",
+        ))
+        n += 1
+        steps.append(_layer(
+            n, "L8", "Defiance gate", "switchingToStimulus",
+            "P(defy) = union(defiance, 1−security, 1−confArmy)  vs  P(Stay_Safe)",
+            (f"DEFIED — P(defy) {defy:.3f} > Stay_Safe {stay:.3f}"
+             if agent["defied"] else
+             f"complies — P(defy) {defy:.3f} ≤ Stay_Safe {stay:.3f}"),
+            "stop" if agent["defied"] else "pass",
+        ))
+        n += 1
+    else:
+        desire_promotion(agent)
+        steps.append(_layer(
+            n, "L6–L8", "No broadcast", "desirePromotion only",
+            "Without ignition, appraisal and the defiance gate never run",
+            "endogenous promotion only", "stop",
+        ))
+        n += 1
+    intention_changed = False
+    options = []
+    if agent["active"]:
+        options = filtering_process(means_end_reasoner(agent, env, p))
+        intention_changed = deliberation_process(agent, options)
+    idx = cell_index(env, agent["i"], agent["j"])
+    here = env["cells"][idx] if idx >= 0 else None
+    steps.append(_layer(
+        n, "L9", "Means-end reasoner", "meansEndReasoner",
+        "Shelter here / walk to nearest shelter / evacuate, given distance and sipBias",
+        (f"{options[0]['option']}  dest ({options[0]['destI']},{options[0]['destJ']})  "
+         f"dist {round((here or {}).get('sd', -1))} m" if options else "no options (no active Stay_Safe)"),
+        "pass" if options else "stop",
+    ))
+    n += 1
+    if intention_changed:
+        if not agent["intentions"]:
+            unfocus_agent(agent, p)
+        else:
+            focus_agent(agent)
+    steps.append(_layer(
+        n, "L10", "Focus / unfocus", "focusAgent / unfocusAgent",
+        "Focused attention bar = sal + (1−sal)/2",
+        (f"focused, attention {agent['attentionThreshold']:.3f}"
+         if agent["focused"] else
+         f"unfocused, attention {agent['attentionThreshold']:.3f}"),
+        "info",
+    ))
+    n += 1
+    can_act = minute >= 0 and minute >= agent["decisionLagMin"] and siren_on
+    steps.append(_layer(
+        n, "L11", "Motor gate (P1)", "canAct",
+        "minute ≥ 0  ∧  minute ≥ own log-normal lag  ∧  siren on",
+        (f"may move (lag {agent['decisionLagMin']} min)" if can_act
+         else f"blocked — t={minute}, lag={agent['decisionLagMin']}, siren={'on' if siren_on else 'off'}"),
+        "pass" if can_act else "stop",
+    ))
+    n += 1
+    if not can_act:
+        agent["metres"] = 0
+    elif agent["intentions"]:
+        go = plan_advancement_evaluation(agent, env)
+        if go:
+            plan_execution(agent, env, p, True)
+    steps.append(_layer(
+        n, "L12", "Plan execution", "planExecution",
+        "Shelter-in-place = 18 m once. Walk = Bohannon speed this minute.",
+        f"{agent['action']} · {agent['metres']:.1f} m",
+        "pass" if agent["metres"] > 0 else "info",
+    ))
+    if stim:
+        agent["heard"] = True
     return {
         "minute": minute,
         "sirenOn": siren_on,
@@ -241,8 +415,12 @@ def trace_minute(agent_in: dict, env: dict, p: dict, siren_on: bool, minute: int
         "heard": agent["heard"],
         "ignited": agent["ignited"],
         "defied": agent["defied"],
+        "focused": agent["focused"],
         "lag": agent["decisionLagMin"],
         "routine": agent["routine"],
+        "steps": steps,
+        "acoustic": acoustic,
+        "exogenous": exogenous,
     }
 
 
@@ -253,11 +431,121 @@ def worked_example(env, pool, exposure, hour, weekday, seed=7) -> dict:
     lag = max(1, agent["decisionLagMin"])
     return {
         "agent": agent,
-        "acoustic": acoustic_saliency(agent["exposure"]),
+        "acoustic": acoustic_saliency(agent["exposure"], DEFAULT_PARAMS, agent),
         "threat": appraise_threat(agent),
         "stay": stay_safe_saliency(agent),
-        "defianceGate": 0.55 * agent["defiance"] + 0.2 * (1 - agent["security"]) + 0.15 * (1 - agent["confArmy"]),
+        "defianceGate": defiance_strength(agent),
+        "attention": agent["attentionThreshold"],
         "pre": trace_minute(agent, env, DEFAULT_PARAMS, False, -1),
         "onset": trace_minute(agent, env, DEFAULT_PARAMS, True, 0),
         "afterLag": trace_minute(agent, env, DEFAULT_PARAMS, True, lag),
     }
+
+
+def appraisal_breakdown(agent: dict) -> dict:
+    cues = threat_cues(agent)
+    w = agent.get("appraisalW") or list(APPRAISAL_PRIOR)
+    parts = []
+    for i, label in enumerate(APPRAISAL_CUE_LABELS):
+        cue = cues[i]
+        weight = w[i]
+        survive = (1 - min(1 - 1e-12, max(0.0, cue))) ** weight
+        parts.append({
+            "label": label,
+            "weight": weight,
+            "value": cue,
+            "product": weight * cue,
+            "fire": 1 - survive,
+            "survive": survive,
+        })
+    return {"parts": parts, "threat": union_probability(cues, w)}
+
+
+def processor_audit(pool: List[dict], n=280, seed=19) -> dict:
+    env = build_env(synthetic_city(12))
+    pop = make_population(n, env, pool, DEFAULT_PARAMS, mulberry32(seed), 0, 14, 2)
+    threat = [appraise_threat(a) for a in pop]
+    stay = [stay_safe_saliency(a, DEFAULT_PARAMS) for a in pop]
+    defy = [defiance_strength(a) for a in pop]
+    comply = sum(1 for i, a in enumerate(pop) if stay[i] >= defy[i]) / max(1, len(pop))
+    return {
+        "n": len(pop),
+        "threat": histogram(threat),
+        "stay": histogram(stay),
+        "defy": histogram(defy),
+        "idle": histogram([a["idleBar"] for a in pop], bins=8, lo=0.12, hi=0.55),
+        "tau": histogram([a["habituationTau"] for a in pop], bins=8, lo=80, hi=450),
+        "stayMix": histogram([a["stayMix"] for a in pop], bins=8, lo=0.12, hi=0.75),
+        "s0": histogram([a["acousticBase"] for a in pop], bins=8, lo=0.45, hi=0.995),
+        "comply": comply,
+        "meanThreat": sum(threat) / len(threat),
+        "meanStay": sum(stay) / len(stay),
+        "meanDefy": sum(defy) / len(defy),
+        "pop": pop,
+    }
+
+
+def placement_audit(env, pool, n=400, seed=11) -> dict:
+    rng = mulberry32(seed)
+    pop = make_population(n, env, pool, DEFAULT_PARAMS, rng, 0, 12, 2)
+    counts = [0] * len(env["cells"])
+    for a in pop:
+        idx = env["lookup"][a["i"] + a["j"] * env["n"]]
+        if idx >= 0:
+            counts[idx] += 1
+    unique = sum(1 for c in counts if c > 0)
+    order = sorted(range(len(env["cells"])), key=lambda i: env["cells"][i].get("pop") or 0, reverse=True)
+    top_cells = max(1, int(math.floor(len(env["cells"]) * 0.1)))
+    pop_top = sum((env["cells"][i].get("pop") or 0) for i in order[:top_cells])
+    agents_top = sum(counts[i] for i in order[:top_cells])
+    return {
+        "n": n,
+        "unique": unique,
+        "agentsTopShare": agents_top / n if n else 0,
+        "popTopShare": pop_top / env["massTotal"] if env["massTotal"] else 0,
+        "topCells": top_cells,
+        "occupied": len(env["cells"]),
+        "pop": pop,
+        "counts": counts,
+    }
+
+
+def folds_note() -> dict:
+    regions = ["West 1", "West 2", "South", "East 1", "East 2", "Centre", "North"]
+    folds = [{"holdout": h, "train": [r for r in regions if r != h]} for h in regions[:5]]
+    return {
+        "folds": folds,
+        "simile": "Simile's 0.16 TVD threshold came from ~2,750 ratings by 14 of their raters on their own question set. Ours would have to be earned the same way, or not claimed.",
+    }
+
+
+def confidence_note() -> dict:
+    return {
+        "ready": False,
+        "reason": "Confidence is unfitted. It reads internal state at the decision cycle and needs (simulation, observed) pairs — the original Van Dijcke coefficients, which are not in hand.",
+    }
+
+
+PIPELINE = [
+    {"id": "ingest", "n": "01", "title": "Ingest",
+     "body": "OSM footprints, SRTM elevation, WorldPop 2020 mass, WVS Wave 7 Kyiv microdata, air-raid alert times, reconstructed Van Dijcke curves."},
+    {"id": "grid", "n": "02", "title": "Lattice",
+     "body": "Snap the city onto a 250 m grid. Occupied cells, shelter graph, metro, WorldPop mass per cell."},
+    {"id": "people", "n": "03", "title": "Population",
+     "body": "Resample WVS respondents for traits. Draw WorldPop mass for home cells. Draw lag, speed, circadian mix."},
+    {"id": "sense", "n": "04", "title": "Sense",
+     "body": "Each minute: is the siren on? Acoustic saliency s₀ exp(−n/τ). Routine sets the attention bar."},
+    {"id": "ignite", "n": "05", "title": "Ignite",
+     "body": "If saliency ≥ attention, the coalition occupies the workspace. Otherwise the rest of the cycle never hears it."},
+    {"id": "appraise", "n": "06", "title": "Appraise",
+     "body": "WVS constructs are probabilities. Threat is their union (noisy-OR) with Dirichlet γ. Stay_Safe = P(hear)·P(floor ∪ threat). Defiance is a second union."},
+    {"id": "plan", "n": "07", "title": "Plan",
+     "body": "Means-end: shelter here, walk to nearest shelter, or evacuate. Deliberation picks one intention."},
+    {"id": "motor", "n": "08", "title": "Motor",
+     "body": "P1: nothing moves before t = 0. Then own log-normal lag, then Bohannon speed. 18 m for shelter-in-place."},
+    {"id": "window", "n": "09", "title": "Window",
+     "body": "Sum metres over agents, t = −10…+30. That vector is the simulated event-study curve."},
+    {"id": "judge", "n": "10", "title": "Judge",
+     "body": "Architecture tests on a synthetic city. Identifying design. Shape vs reconstructed Van Dijcke. Honest miss on levels."},
+]
+

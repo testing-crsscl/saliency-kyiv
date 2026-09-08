@@ -44,9 +44,10 @@ def focus_agent(agent: dict) -> None:
 
 
 def unfocus_agent(agent: dict, p: dict) -> None:
+    bar = agent.get("idleBar", p["idleThreshold"])
     agent["focused"] = False
-    agent["saliencyThreshold"] = p["idleThreshold"]
-    agent["attentionThreshold"] = p["idleThreshold"]
+    agent["saliencyThreshold"] = bar
+    agent["attentionThreshold"] = bar
     agent["inhibited"] = set()
 
 
@@ -58,8 +59,8 @@ def switching_to_stimulus(agent: dict, p: dict) -> bool:
     if not stay:
         return False
     stay_sal = stay_safe_saliency(agent, p)
-    defiance_gate = 0.55 * agent["defiance"] + 0.2 * (1 - agent["security"]) + 0.15 * (1 - agent["confArmy"])
-    if defiance_gate > stay_sal:
+    defy = defiance_strength(agent)
+    if defy > stay_sal:
         agent["defied"] = True
         agent["gw"]["winner"] = "routine" if agent["focused"] else "none"
         return False
